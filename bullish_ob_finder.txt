@@ -1,0 +1,165 @@
+//@version=6
+indicator("OB Helper: Array-Based Bullish OB", overlay=true, max_bars_back=4000)
+
+// 1) Параметры
+pivotLen    = input.int(1,   "Pivot Length", minval=1)
+tf          = input.timeframe("15", "Pivot TF")
+const int MAX_LOOKBACK = 3000
+
+// 2) Данные с нужного TF
+[open15, high15, low15, close15, _] = request.security(syminfo.tickerid, tf, [open, high, low, close, volume], lookahead = barmerge.lookahead_off)
+
+// 3) Pivot-ы
+ph   = ta.pivothigh(high15, pivotLen, pivotLen)
+pl   = ta.pivotlow (low15,  pivotLen, pivotLen)
+isPH = not na(ph)
+isPL = not na(pl)
+
+// 4) Массивы состояния зон
+var int[]   backBars     = array.new_int()     // bar_index первой BACK-свечи (pivot-low)
+var float[] backWicks   = array.new_float()   // её high
+var float[] pivotLows   = array.new_float()   // уровень pivot-low
+var int[]   pivotBars   = array.new_int()     // индекс самого pivot-low
+var box[]   liveBoxes   = array.new_box()     // графические боксы
+
+// 4.1) Для чередования BACK↔FORWARD
+var int[]   lastFwdBars    = array.new_int()   // последний FORWARD-бар
+var float[] lastBodyHighs  = array.new_float() // его bodyHigh
+var int[]   lastBackBars   = array.new_int()   // последний BACK-бар
+var float[] lastBackWicks  = array.new_float() // его high
+var bool[]  searchBack     = array.new_bool()  // false→FORWARD, true→BACK
+var bool[]  firstFwdDone   = array.new_bool()  // true←первая FORWARD-фаза отработала
+
+// 4.2) Функция удаления зоны из всех массивов
+f_deleteZone(_i) =>
+    box.delete(   array.get(liveBoxes,    _i))
+    array.remove(backBars,     _i)
+    array.remove(backWicks,    _i)
+    array.remove(pivotLows,    _i)
+    array.remove(pivotBars,    _i)
+    array.remove(liveBoxes,    _i)
+    array.remove(lastFwdBars,  _i)
+    array.remove(lastBodyHighs,_i)
+    array.remove(lastBackBars, _i)
+    array.remove(lastBackWicks,_i)
+    array.remove(searchBack,   _i)
+    array.remove(firstFwdDone, _i)
+
+// 5) Инициализация новой зоны при Pivot-Low (BACK-фаза)
+backOffset = pivotLen + 1
+if isPL and barstate.isconfirmed
+    pivotBar   = bar_index - pivotLen
+    backBar    = pivotBar - 1
+    backHigh   = high15[backOffset]
+    pivotLowV  = low15[pivotLen]
+
+    array.push(backBars,     backBar)
+    array.push(backWicks,    backHigh)
+    array.push(pivotLows,    pivotLowV)
+    array.push(pivotBars,    pivotBar)
+    array.push(lastFwdBars,  na)
+    array.push(lastBodyHighs, na)
+    array.push(lastBackBars, backBar)
+    array.push(lastBackWicks, backHigh)
+    array.push(searchBack,    false)   // сначала FORWARD
+    array.push(firstFwdDone,  false)   // ещё не было первой FORWARD
+
+    b = box.new(left = backBar, top = backHigh, right = backBar, bottom = pivotLowV, xloc = xloc.bar_index, bgcolor = color.new(color.green, 80), border_color = color.green, border_width = 1)
+    array.push(liveBoxes, b)
+
+pivotOffset = pivotLen
+
+// 6) Основной цикл по всем зонам (reverse order)
+len = array.size(backBars)
+if len > 0
+    for idx = len - 1 to 0
+        bb      = array.get(backBars,    idx)
+        // 6.1) Устарела?
+        if bar_index - bb > MAX_LOOKBACK
+            f_deleteZone(idx)
+            continue
+
+        // 6.2) Текущее состояние
+        bw      = array.get(backWicks,    idx)
+        plv     = array.get(pivotLows,    idx)
+        pb      = array.get(pivotBars,    idx)
+        b       = array.get(liveBoxes,    idx)
+        currFwd = array.get(lastFwdBars,  idx)
+        currHigh= array.get(lastBodyHighs,idx)
+        currBack= array.get(lastBackBars, idx)
+        backWk  = array.get(lastBackWicks,idx)
+        inBack  = array.get(searchBack,   idx)
+        fwdDone = array.get(firstFwdDone, idx)
+
+        // --- 6.3) Первая FORWARD-фаза (впервые) ---
+        if not fwdDone and na(currFwd)
+            startF = pb + 1
+            endF   = math.min(bar_index, currBack + MAX_LOOKBACK)
+            for f = startF to endF
+                rel = bar_index - f
+                // 6.3.1) Пробой вниз pivotLow? → отменяем зону
+                if low15[rel] < plv
+                    f_deleteZone(idx)
+                    break
+                // 6.3.2) Тело свечи перекрыло backWick сверху?
+                bodyHigh = math.max(open15[rel], close15[rel])
+                if bodyHigh >= backWk
+                    box.set_right(b, f)
+                    array.set(lastFwdBars,   idx, f)
+                    array.set(lastBodyHighs, idx, bodyHigh)
+                    array.set(searchBack,    idx, true)   // сразу BACK-фаза
+                    array.set(firstFwdDone,  idx, true)   // первичную больше не делать
+                    break
+            continue
+
+        // --- 6.4) Обычная BACK-фаза (searchBack == true) ---
+        if inBack
+            startB = array.get(lastBackBars, idx)
+            cnt    = math.min(startB, MAX_LOOKBACK)
+            for i = 0 to cnt
+                backIdx = startB - i
+                rel     = bar_index - backIdx
+                // 6.4.1) Появился pivotHigh? → завершаем
+                shiftedRel = rel - pivotOffset
+                if shiftedRel >= 0 and not na(ph[shiftedRel])
+                    // backIdx сейчас указывает на свечу, следующую за экстремумом:
+                    extremumBar  = backIdx
+                    extremumHigh = high15[rel]   // тень экстремальной свечи
+
+                    // рисуем левую грань на extremumBar
+                    // и верхнюю границу по его тени
+                    box.set_left( b, extremumBar)
+                    box.set_top(  b, extremumHigh)
+
+                    // переключаемся в FORWARD-фазу
+                    array.set(searchBack, idx, false)
+                    break
+                // 6.4.2) Обычная BACK-свеча
+                w = high15[rel]
+                if w > array.get(lastBodyHighs, idx)
+                    box.set_left(  b, backIdx)
+                    box.set_top(   b, w)
+                    array.set(lastBackBars,  idx, backIdx)
+                    array.set(lastBackWicks, idx, w)
+                    array.set(searchBack,    idx, false)  // в FORWARD
+                    break
+            continue
+
+        // --- 6.5) Обычная FORWARD-фаза (searchBack == false) ---
+        startF = array.get(lastFwdBars, idx)
+        endF   = math.min(bar_index, bb + MAX_LOOKBACK)
+        for f = startF to endF
+            rel = bar_index - f
+            // 6.5.1) Пробой вниз pivotLow? → финализируем
+            if low15[rel] < plv
+                array.set(firstFwdDone, idx, true)
+                break
+            // 6.5.2) Обычная FORWARD-свеча
+            bodyHigh = math.max(open15[rel], close15[rel])
+            if bodyHigh >= array.get(lastBackWicks, idx)
+                box.set_right(b, f)
+                array.set(lastFwdBars,   idx, f)
+                array.set(lastBodyHighs, idx, bodyHigh)
+                array.set(searchBack,    idx, true)   // в BACK
+                break
+        continue
